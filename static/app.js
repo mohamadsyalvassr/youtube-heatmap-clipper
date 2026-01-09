@@ -57,6 +57,16 @@ const I18N = {
     "js.preview.loading": "Loading preview…",
     "js.progress.count": "{done}/{total} selesai • {success} sukses",
     "js.selected.count": "{count} dipilih",
+    "js.stage.download": "Download",
+    "js.stage.crop": "Crop",
+    "js.stage.subtitle": "Subtitle",
+    "js.stage.subtitle_model_load": "Load model",
+    "js.stage.subtitle_transcribe": "Transcribe",
+    "js.stage.subtitle_write": "Tulis subtitle",
+    "js.stage.burn_subtitle": "Burn subtitle",
+    "js.stage.finalize": "Finalize",
+    "js.stage.done_clip": "Selesai",
+    "js.topprogress.processing": "Processing",
   },
   en: {
     "top.tagline": "Scan Most Replayed, auto cut, clean subtitles.",
@@ -114,6 +124,16 @@ const I18N = {
     "js.preview.loading": "Loading preview…",
     "js.progress.count": "{done}/{total} done • {success} success",
     "js.selected.count": "{count} selected",
+    "js.stage.download": "Download",
+    "js.stage.crop": "Crop",
+    "js.stage.subtitle": "Subtitle",
+    "js.stage.subtitle_model_load": "Load model",
+    "js.stage.subtitle_transcribe": "Transcribe",
+    "js.stage.subtitle_write": "Write subtitles",
+    "js.stage.burn_subtitle": "Burn subtitles",
+    "js.stage.finalize": "Finalize",
+    "js.stage.done_clip": "Done",
+    "js.topprogress.processing": "Processing",
   },
 };
 
@@ -129,6 +149,125 @@ function t(key, vars) {
     });
   }
   return s;
+}
+
+const TOP_PROGRESS = {
+  pct: 0,
+  titleBase: document.title || "YouTube Heatmap Clipper",
+  hideTimer: null,
+};
+
+function clamp(n, a, b) {
+  return Math.min(b, Math.max(a, n));
+}
+
+function easeOutCubic(x) {
+  const t = clamp(x, 0, 1);
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function stageLabel(stage) {
+  const key = {
+    download: "js.stage.download",
+    crop: "js.stage.crop",
+    subtitle: "js.stage.subtitle",
+    subtitle_model_load: "js.stage.subtitle_model_load",
+    subtitle_transcribe: "js.stage.subtitle_transcribe",
+    subtitle_write: "js.stage.subtitle_write",
+    burn_subtitle: "js.stage.burn_subtitle",
+    finalize: "js.stage.finalize",
+    done_clip: "js.stage.done_clip",
+  }[stage];
+  return key ? t(key) : stage || "";
+}
+
+function computeJobPct(job) {
+  if (!job) return { pct: 0, text: "", active: false };
+  const status = job.status || "";
+  if (status !== "running" && status !== "queued") {
+    const done = Number(job.done || 0);
+    const total = Number(job.total || 0);
+    const pct = total > 0 ? clamp((done / total) * 100, 0, 100) : 0;
+    return { pct, text: "", active: false };
+  }
+
+  const total = Math.max(1, Number(job.total || 1));
+  const done = clamp(Number(job.done || 0), 0, total);
+  const subtitleEnabled = Boolean(job.subtitle_enabled);
+  const stage = job.stage || "";
+  const stageAt = job.stage_at ? Number(job.stage_at) : 0;
+  const elapsed = stageAt ? Date.now() - stageAt : 0;
+  const clipIndexRaw = Number(job.stage_clip || job.current || (done + 1) || 1);
+  const clipIndex = clamp(clipIndexRaw, 1, total);
+
+  const mapNoSub = {
+    download: { a: 0.04, b: 0.62, d: 14000 },
+    crop: { a: 0.62, b: 0.96, d: 9000 },
+    finalize: { a: 0.96, b: 0.995, d: 2500 },
+    done_clip: { a: 1, b: 1, d: 0 },
+  };
+  const mapSub = {
+    download: { a: 0.03, b: 0.55, d: 14000 },
+    crop: { a: 0.55, b: 0.86, d: 9000 },
+    subtitle: { a: 0.86, b: 0.87, d: 1200 },
+    subtitle_model_load: { a: 0.87, b: 0.885, d: 2500 },
+    subtitle_transcribe: { a: 0.885, b: 0.93, d: 20000 },
+    subtitle_write: { a: 0.93, b: 0.94, d: 1800 },
+    burn_subtitle: { a: 0.94, b: 0.985, d: 12000 },
+    finalize: { a: 0.985, b: 0.995, d: 2500 },
+    done_clip: { a: 1, b: 1, d: 0 },
+  };
+
+  const table = subtitleEnabled ? mapSub : mapNoSub;
+  const s = table[stage] || (subtitleEnabled ? mapSub.download : mapNoSub.download);
+  const within = s.d > 0 ? s.a + (s.b - s.a) * easeOutCubic(clamp(elapsed / s.d, 0, 0.98)) : s.a;
+  const pctBase = ((clipIndex - 1) + within) / total * 100;
+  const pctFloor = (done / total) * 100;
+  const pct = clamp(Math.max(pctBase, pctFloor), 0, 99.5);
+
+  const clipText = total > 0 ? `clip ${clipIndex}/${total}` : "";
+  const sLabel = stageLabel(stage);
+  const text = [t("js.topprogress.processing"), clipText, sLabel].filter(Boolean).join(" • ");
+  return { pct, text, active: true };
+}
+
+function renderTopProgress(job) {
+  const wrap = $("topProgressWrap");
+  const bar = $("topProgressBar");
+  const textEl = $("topProgressText");
+  if (!wrap || !bar || !textEl) return;
+
+  const { pct, text, active } = computeJobPct(job);
+
+  if (!active) {
+    if (job && (job.status === "done" || job.status === "error")) {
+      bar.style.width = "100%";
+      textEl.textContent = job.status === "error" ? "Error" : "";
+      wrap.classList.remove("hide");
+      clearTimeout(TOP_PROGRESS.hideTimer);
+      TOP_PROGRESS.hideTimer = setTimeout(() => {
+        wrap.classList.add("hide");
+        bar.style.width = "0%";
+        textEl.textContent = "";
+      }, 650);
+      document.title = TOP_PROGRESS.titleBase;
+      TOP_PROGRESS.pct = 0;
+      return;
+    }
+    wrap.classList.add("hide");
+    bar.style.width = "0%";
+    textEl.textContent = "";
+    document.title = TOP_PROGRESS.titleBase;
+    TOP_PROGRESS.pct = 0;
+    return;
+  }
+
+  clearTimeout(TOP_PROGRESS.hideTimer);
+  wrap.classList.remove("hide");
+  TOP_PROGRESS.pct = Math.max(TOP_PROGRESS.pct, pct);
+  bar.style.width = `${TOP_PROGRESS.pct.toFixed(1)}%`;
+  textEl.textContent = text;
+  document.title = `${TOP_PROGRESS.titleBase} (${Math.round(TOP_PROGRESS.pct)}%)`;
 }
 
 function applyI18n() {
@@ -366,10 +505,12 @@ function renderProgress(job) {
   out.innerHTML = "";
   meta.textContent = "";
   if (!job) return;
+  renderTopProgress(job);
   const total = Number(job.total || 0);
   const done = Number(job.done || 0);
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  meta.textContent = `${job.status} • ${job.status_text || ""}`.trim();
+  const stage = stageLabel(job.stage || "");
+  meta.textContent = `${job.status} • ${(job.status_text || "").trim()}${stage ? " • " + stage : ""}`.trim();
 
   const bar = document.createElement("div");
   bar.innerHTML = `<div class="bar"><div style="width:${pct}%"></div></div>`;

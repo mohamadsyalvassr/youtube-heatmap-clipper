@@ -316,38 +316,65 @@ def get_duration(video_id):
     return 3600
 
 
-def generate_subtitle(video_file, subtitle_file):
+def generate_subtitle(video_file, subtitle_file, event_hook=None):
     """
     Generate subtitle file using Faster-Whisper for the given video.
     Returns True if successful, False otherwise.
     """
-    try:
-        from faster_whisper import WhisperModel
-        
+    from faster_whisper import WhisperModel
+
+    def load_and_transcribe():
+        if callable(event_hook):
+            try:
+                event_hook("stage", {"stage": "subtitle_model_load"})
+            except Exception:
+                pass
         print(f"  Loading Faster-Whisper model '{WHISPER_MODEL}'...")
         print(f"  (If this is first time, downloading ~{get_model_size(WHISPER_MODEL)}...)")
-        # Use int8 for CPU efficiency, or "float16" for GPU
         model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        
         print("  ✅ Model loaded. Transcribing audio (4-5x faster than standard Whisper)...")
+        if callable(event_hook):
+            try:
+                event_hook("stage", {"stage": "subtitle_transcribe"})
+            except Exception:
+                pass
         segments, info = model.transcribe(video_file, language="id")
-        
-        # Generate SRT format
-        print("  Generating subtitle file...")
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(segments, start=1):
-                start_time = format_timestamp(segment.start)
-                end_time = format_timestamp(segment.end)
-                text = segment.text.strip()
-                
-                f.write(f"{i}\n")
-                f.write(f"{start_time} --> {end_time}\n")
-                f.write(f"{text}\n\n")
-        
-        return True
+        return segments
+
+    try:
+        segments = load_and_transcribe()
     except Exception as e:
-        print(f"  Failed to generate subtitle: {str(e)}")
-        return False
+        msg = str(e)
+        if os.name == "nt" and "WinError 1314" in msg:
+            print(f"  Failed to generate subtitle: {msg}")
+            print("  Windows kamu kelihatan tidak mengizinkan symlink (HuggingFace cache).")
+            print("  Retrying sekali lagi (biasanya langsung beres setelah fallback cache aktif)...")
+            try:
+                segments = load_and_transcribe()
+            except Exception as e2:
+                print(f"  Failed to generate subtitle: {str(e2)}")
+                return False
+        else:
+            print(f"  Failed to generate subtitle: {msg}")
+            return False
+
+    if callable(event_hook):
+        try:
+            event_hook("stage", {"stage": "subtitle_write"})
+        except Exception:
+            pass
+    print("  Generating subtitle file...")
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        for i, segment in enumerate(segments, start=1):
+            start_time = format_timestamp(segment.start)
+            end_time = format_timestamp(segment.end)
+            text = segment.text.strip()
+
+            f.write(f"{i}\n")
+            f.write(f"{start_time} --> {end_time}\n")
+            f.write(f"{text}\n\n")
+
+    return True
 
 
 def format_timestamp(seconds):
@@ -361,7 +388,7 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default", use_subtitle=False):
+def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default", use_subtitle=False, event_hook=None):
     """
     Download, crop, and export a single vertical clip
     based on a heatmap segment.
@@ -379,7 +406,7 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
     if end - start < 3:
         return False
 
-    temp_file = f"temp_{index}.mp4"
+    temp_file = f"temp_{index}.mkv"
     cropped_file = f"temp_cropped_{index}.mp4"
     subtitle_file = f"temp_{index}.srt"
     output_file = os.path.join(OUTPUT_DIR, f"clip_{index}.mp4")
@@ -388,6 +415,11 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
         f"[Clip {index}] Processing segment "
         f"({int(start)}s - {int(end)}s, padding {PADDING}s)"
     )
+    if callable(event_hook):
+        try:
+            event_hook("stage", {"stage": "download", "clip_index": index})
+        except Exception:
+            pass
 
     cmd_download = [
         sys.executable, "-m", "yt_dlp",
@@ -396,20 +428,46 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
         "--downloader", "ffmpeg",
         "--downloader-args",
         f"ffmpeg_i:-ss {start} -to {end} -hide_banner -loglevel error",
+        "--merge-output-format", "mkv",
         "-f",
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+        "-o", temp_file,
+        f"https://youtu.be/{video_id}"
+    ]
+    cmd_download_fallback = [
+        sys.executable, "-m", "yt_dlp",
+        "--force-ipv4",
+        "--quiet", "--no-warnings",
+        "--downloader", "ffmpeg",
+        "--downloader-args",
+        f"ffmpeg_i:-ss {start} -to {end} -hide_banner -loglevel error",
+        "--merge-output-format", "mkv",
+        "-f", "bv*+ba/b",
         "-o", temp_file,
         f"https://youtu.be/{video_id}"
     ]
 
     try:
-        result = subprocess.run(
-            cmd_download,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        try:
+            subprocess.run(
+                cmd_download,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            if "Requested format is not available" in stderr:
+                subprocess.run(
+                    cmd_download_fallback,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+            else:
+                raise
 
         if not os.path.exists(temp_file):
             print("Failed to download video segment.")
@@ -496,6 +554,11 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
                     cropped_file
                 ]
 
+        if callable(event_hook):
+            try:
+                event_hook("stage", {"stage": "crop", "clip_index": index})
+            except Exception:
+                pass
         print("  Cropping video...")
         result = subprocess.run(
             cmd_crop,
@@ -509,8 +572,18 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
 
         # Generate and burn subtitle if enabled
         if use_subtitle:
+            if callable(event_hook):
+                try:
+                    event_hook("stage", {"stage": "subtitle", "clip_index": index})
+                except Exception:
+                    pass
             print("  Generating subtitle...")
-            if generate_subtitle(cropped_file, subtitle_file):
+            if generate_subtitle(cropped_file, subtitle_file, event_hook=event_hook):
+                if callable(event_hook):
+                    try:
+                        event_hook("stage", {"stage": "burn_subtitle", "clip_index": index})
+                    except Exception:
+                        pass
                 print("  Burning subtitle to video...")
                 # Get absolute path for subtitle file
                 subtitle_path = escape_subtitles_filter_path(subtitle_file)
@@ -542,12 +615,27 @@ def proses_satu_clip(video_id, item, index, total_duration, crop_mode="default",
             else:
                 # If subtitle generation failed, use cropped file as output
                 print("  Subtitle generation failed, continuing without subtitle...")
+                if callable(event_hook):
+                    try:
+                        event_hook("stage", {"stage": "finalize", "clip_index": index})
+                    except Exception:
+                        pass
                 os.rename(cropped_file, output_file)
         else:
             # No subtitle, rename cropped file to output
+            if callable(event_hook):
+                try:
+                    event_hook("stage", {"stage": "finalize", "clip_index": index})
+                except Exception:
+                    pass
             os.rename(cropped_file, output_file)
 
         print("Clip successfully generated.")
+        if callable(event_hook):
+            try:
+                event_hook("stage", {"stage": "done_clip", "clip_index": index})
+            except Exception:
+                pass
         return True
 
     except subprocess.CalledProcessError as e:

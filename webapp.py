@@ -102,6 +102,7 @@ def run_job(job_id, payload):
         padding = safe_int(payload.get("padding"), 10)
         max_clips = safe_int(payload.get("max_clips"), 10)
         mode = payload.get("mode") or "heatmap"
+        set_job(job_id, subtitle_enabled=subtitle)
 
         core.WHISPER_MODEL = whisper_model
         core.SUBTITLE_FONT = subtitle_font
@@ -158,10 +159,17 @@ def run_job(job_id, payload):
 
         set_job(job_id, total=len(targets), done=0, status_text="processing")
 
+        def event_hook(kind, data):
+            if kind != "stage" or not isinstance(data, dict):
+                return
+            stage = data.get("stage") or ""
+            clip_index = safe_int(data.get("clip_index"), 0) or 0
+            set_job(job_id, stage=stage, stage_at=now_ms(), stage_clip=clip_index)
+
         success = 0
         for idx, item in enumerate(targets, start=1):
             set_job(job_id, current=idx, status_text=f"clip {idx}/{len(targets)}")
-            ok = core.proses_satu_clip(video_id, item, idx, total_duration, crop, subtitle)
+            ok = core.proses_satu_clip(video_id, item, idx, total_duration, crop, subtitle, event_hook=event_hook)
             if ok:
                 success += 1
             set_job(job_id, done=idx, success=success, outputs=list_outputs(job_dir))
@@ -268,6 +276,10 @@ def api_clip():
             "success": 0,
             "current": 0,
             "status_text": "",
+            "stage": "",
+            "stage_at": None,
+            "stage_clip": 0,
+            "subtitle_enabled": False,
             "outputs": [],
             "logs": [],
         }
